@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <climits>
 
 // ── Pattern decode (inverse of greloc.c packpattern) ────────────────────────
 // Binary layout: 0x00=END, 0x01-0x3F=instr-change, 0x40-0x4F=note+FX,
@@ -91,6 +92,7 @@ int main(int argc, char *argv[]) {
     else         ds=hdr;
     auto s2f=[&](int s){ return s-la+ds; };
     auto f2s=[&](int f){ return f-ds+la; };
+    auto inb=[&](int f){ return f>=0&&f<flen; };
 
     const uint8_t *code=sid+ds;
     int code_len=flen-ds;
@@ -106,6 +108,7 @@ int main(int argc, char *argv[]) {
             i+=2;
         }
     }
+    (void)aset; (void)acnt;
 
     // ── Locate instrument cluster (column-major table in binary) ─────────────
     // Each column is an array of N_INSTR bytes accessed via LDA col_base,Y.
@@ -142,57 +145,265 @@ int main(int argc, char *argv[]) {
     int N_INSTR=(N_COLS>1)?(icols[1]-icols[0]):best_g;
     printf("N_INSTR=%d  N_COLS=%d  mt_wavetbl=SID %04x\n",N_INSTR,N_COLS,mt_wavetbl);
 
-    // ── Locate WTBL rtable (mt_notetbl) ──────────────────────────────────────
-    int mt_notetbl=0;
-    for(auto&[sa,co]:da){
-        if(sa<=mt_wavetbl) continue;
-        if((aset.count(sa-1)&&sa-1>mt_wavetbl)||(aset.count(sa+1)&&sa+1>mt_wavetbl)){
-            mt_notetbl=std::max(sa,(aset.count(sa+1)?sa+1:sa))+1; break;
+    // ── Find song and pattern tables from player code ─────────────────────────
+    // Signature: LDA tbl_lo,Y / STA zp / LDA tbl_hi,Y / STA zp
+    // Orderlist variant has LDA (zp),Y / CMP #$FF after; pattern variant doesn't.
+    int mt_songtbllo=-1,mt_songtblhi=-1,mt_patttbllo=-1,mt_patttblhi=-1;
+#ifdef DEBUG_COLS
+    std::vector<std::tuple<int,int,bool>> all_cands; // a1,a2,has_ol
+#endif
+    for(int i=0;i<code_len-20;i++){
+        if(code[i]!=0xB9) continue;
+        int a1=code[i+1]|(code[i+2]<<8);
+        if(a1<la||a1>=la+code_len) continue;
+        if(code[i+3]!=0x85) continue;
+        uint8_t zp1=code[i+4];
+        for(int j=i+5;j<i+14&&j+4<code_len;j++){
+            if(code[j]!=0xB9) continue;
+            int a2=code[j+1]|(code[j+2]<<8);
+            if(a2<=a1||a2>=la+code_len) continue;
+            if(code[j+3]!=0x85) continue;
+            bool has_ol=false;
+            for(int k=j+5;k<j+40&&k+3<code_len;k++)
+                if(code[k]==0xB1&&code[k+1]==zp1&&code[k+2]==0xC9&&code[k+3]==0xFF){has_ol=true;break;}
+#ifdef DEBUG_COLS
+            all_cands.push_back({a1,a2,has_ol});
+#endif
+            if(has_ol&&mt_songtbllo<0){mt_songtbllo=a1;mt_songtblhi=a2;}
+            else if(!has_ol&&mt_patttbllo<0){mt_patttbllo=a1;mt_patttblhi=a2;}
+            break;
         }
     }
-    if(!mt_notetbl){int mx=1;if(N_COLS>2)for(int i=0;i<N_INSTR;i++)mx=std::max(mx,(int)sid[s2f(icols[2]+1+i)]);mt_notetbl=mt_wavetbl+mx+4;}
-    int N_WTBL=mt_notetbl-mt_wavetbl;
-    printf("N_WTBL=%d  mt_notetbl=SID %04x\n",N_WTBL,mt_notetbl);
+#ifdef DEBUG_COLS
+    printf("all LDA-pair candidates (a1,a2,has_ol):\n");
+    for(auto&[a1,a2,ho]:all_cands) printf("  %04x %04x %s\n",a1,a2,ho?"ol":"--");
+#endif
+    if(mt_songtbllo<0||mt_patttbllo<0){fprintf(stderr,"Could not find song/pattern tables in 6502 code\n");return 1;}
+#ifdef DEBUG_COLS
+    printf("songtbl=%04x/%04x  patttbl=%04x/%04x\n",mt_songtbllo,mt_songtblhi,mt_patttbllo,mt_patttblhi);
+#endif
 
-    // ── Locate PTBL ──────────────────────────────────────────────────────────
-    int wtbl_r_end=mt_notetbl+N_WTBL;
-    int mt_ptbl=wtbl_r_end;
-    if(!aset.count(wtbl_r_end-1)) for(int d=-5;d<=5;d++) if(aset.count(wtbl_r_end+d-1)){mt_ptbl=wtbl_r_end+d;break;}
-    printf("mt_ptbl=SID %04x\n",mt_ptbl);
-    int mt_pulsespd=0;
-    for(auto&[sa,cnt]:acnt) if(sa>mt_ptbl&&cnt>=2){mt_pulsespd=sa+1;break;}
-    if(!mt_pulsespd) mt_pulsespd=mt_ptbl+N_INSTR*3;
-    int N_PTBL=mt_pulsespd-mt_ptbl;
-    printf("N_PTBL=%d  mt_pulsespd=SID %04x\n",N_PTBL,mt_pulsespd);
+    int n_songs_v=(mt_songtblhi-mt_songtbllo)/3;
+    int n_patts_v=mt_patttblhi-mt_patttbllo;
+    int mt_insad_v=mt_patttblhi+n_patts_v;
 
-    // ── Detect nowavedelay ────────────────────────────────────────────────────
-    bool nowavedelay=true;
-    { bool dir=false,shft=false;
-      for(int k=0;k<N_WTBL;k++){uint8_t v=sid[s2f(mt_wavetbl+k)];if(v==0x41||v==0x81)dir=true;if(v==0x51||v==0x91)shft=true;}
-      if(!dir&&shft) nowavedelay=false; }
-    printf("nowavedelay=%d\n",(int)nowavedelay);
-
-    // ── Derive column flags from N_COLS ───────────────────────────────────────
-    // Layout: AD,SR,WPTR,[PPTR],[ FPTR],[SPTR,VDLY],[GATE,FW]
-    bool nopulse,nofilter,noinsvib,fixedparams;
-    nopulse=(N_PTBL==0);
-    { int rem=N_COLS-3-(nopulse?0:1);
-      nofilter=(rem<5); if(!nofilter) rem--;
-      noinsvib=(rem<2); fixedparams=(noinsvib?(rem<2):(rem<4)); }
+    // ── Refine instrument cluster using definitive mt_insad ───────────────────
+    {
+        std::vector<int> ic2;
+        for(auto&[sa,co]:cl) if(sa>=mt_insad_v-1) ic2.push_back(sa);
+        if(ic2.size()>=2){
+            icols=ic2; N_COLS=(int)icols.size()-1; N_INSTR=icols[1]-icols[0];
+            mt_wavetbl=icols.back()+1;
+            icols.pop_back();
+            printf("N_INSTR=%d  N_COLS=%d  mt_wavetbl=SID %04x (refined)\n",N_INSTR,N_COLS,mt_wavetbl);
+        }
+    }
 
     auto read_col=[&](int ci)->std::vector<uint8_t>{
         std::vector<uint8_t> v(N_INSTR,0);
-        if(ci<N_COLS) for(int i=0;i<N_INSTR;i++) v[i]=sid[s2f(icols[ci]+1+i)];
+        int base=icols[0]+ci*N_INSTR;
+        for(int i=0;i<N_INSTR;i++) v[i]=sid[s2f(base+1+i)];
         return v;
     };
-    int ci=0;
-    auto adc=read_col(ci++),sr=read_col(ci++),wptr=read_col(ci++);
-    auto pptr  =nopulse  ?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-    auto filtpt=nofilter ?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-    auto vibp  =noinsvib ?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-    auto vibd  =noinsvib ?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-    auto gatec =fixedparams?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-    auto firstc=fixedparams?std::vector<uint8_t>(N_INSTR,0):read_col(ci);
+    std::vector<uint8_t> adc=read_col(0), srv=read_col(1), wptr=read_col(2);
+#ifdef DEBUG_COLS
+    {
+        printf("icols:"); for(int v:icols) printf(" %04x",v); printf("\n");
+        for(size_t ci=0;ci<icols.size();ci++){
+            printf("  col%zu(%04x):",ci,(size_t)icols[ci]);
+            for(int i=0;i<N_INSTR;i++) printf(" %02x",sid[s2f(icols[ci]+1+i)]);
+            printf("\n");
+        }
+    }
+#endif
+
+    // ── Locate orderlist start (upper bound for table region) ─────────────────
+    int ol_file=flen;
+    for(int c=0;c<n_songs_v*3;c++){int lo=sid[s2f(mt_songtbllo+c)],hi=sid[s2f(mt_songtblhi+c)];int af=s2f((hi<<8)|lo);if(af>=ds&&af<flen)ol_file=std::min(ol_file,af);}
+    if(ol_file>=flen){fprintf(stderr,"Bad song table addresses\n");return 1;}
+    printf("Orderlists at file %04x\n",ol_file);
+    int ol_SID=f2s(ol_file);
+#ifdef DEBUG_COLS
+    printf("ol_SID=%04x  n_songs=%d n_patts=%d mt_insad_v=%04x\n",ol_SID,n_songs_v,n_patts_v,mt_insad_v);
+#endif
+
+    // ── Unpack ALL patterns once (independent of table addresses) ─────────────
+    // Also build a histogram of table-pointer CMD args, used as minimum table
+    // lengths for the content-sequential reader below.
+    std::vector<std::vector<uint8_t>> patt_data(gt::MAX_PATT, std::vector<uint8_t>(gt::MAX_PATTROWS*4+4,0));
+    std::vector<int> patt_len(gt::MAX_PATT,0);
+    int highest_patt=-1;
+    int max_wptr_cmd=0,max_pptr_cmd=0,max_fptr_cmd=0,max_stbl_cmd=0;
+    for(int p=0;p<n_patts_v&&p<gt::MAX_PATT;p++){
+        int lo=sid[s2f(mt_patttbllo+p)],hi=sid[s2f(mt_patttblhi+p)];
+        int pf=s2f((hi<<8)|lo);
+        if(pf<ds||pf>=flen){patt_len[p]=0;continue;}
+        for(auto&b:patt_data[p]) b=0;
+        int rows=unpack_patt(patt_data[p].data(),sid,pf,flen);
+        patt_len[p]=rows; highest_patt=p;
+        for(int r=0;r<rows;r++){
+            uint8_t cmd=patt_data[p][r*4+2], arg=patt_data[p][r*4+3];
+            switch(cmd){
+                case 8:  max_wptr_cmd=std::max(max_wptr_cmd,(int)arg); break;
+                case 9:  max_pptr_cmd=std::max(max_pptr_cmd,(int)arg); break;
+                case 10: max_fptr_cmd=std::max(max_fptr_cmd,(int)arg); break;
+                case 1: case 2: case 3: case 4: case 14:
+                         max_stbl_cmd=std::max(max_stbl_cmd,(int)arg); break;
+                default: break;
+            }
+        }
+    }
+#ifdef DEBUG_COLS
+    printf("max_wptr_cmd=%d max_pptr_cmd=%d max_fptr_cmd=%d max_stbl_cmd=%d highest_patt=%d\n",
+           max_wptr_cmd,max_pptr_cmd,max_fptr_cmd,max_stbl_cmd,highest_patt);
+#endif
+
+    // ── Jump-consistent table reader (WTBL/PTBL/FTBL) ──────────────────────────
+    // Per gtable.c's exectable()/gettablepartlen(): each table is a sequence of
+    // "parts", each ending in an (0xFF,R) entry where R=0 means stop and R!=0 is
+    // a 1-indexed jump *within the compacted table* (R must be in [0,N]). The
+    // table's total length N is the smallest N>=min_len such that ltable[N-1]
+    // ==0xFF and every internal (0xFF,R) entry has R in [0,N]. L and R arrays
+    // are both exactly N bytes (R immediately follows L).
+    auto find_jump_consistent_len=[&](int start,int min_len,int limit,
+                                       std::vector<uint8_t>&rawL,std::vector<uint8_t>&rawR)->int{
+        if(min_len<1) min_len=1;
+        for(int N=min_len;2*N<=limit;N++){
+            int lf=s2f(start+N-1); if(!inb(lf)) break;
+            if(sid[lf]!=0xff) continue;
+            bool ok=true;
+            for(int k=1;k<=N&&ok;k++){
+                int klf=s2f(start+k-1); if(!inb(klf)){ok=false;break;}
+                if(sid[klf]==0xff){
+                    int krf=s2f(start+N+k-1); if(!inb(krf)){ok=false;break;}
+                    int rk=sid[krf];
+                    if(rk<0||rk>N) ok=false;
+                }
+            }
+            if(ok){
+                rawL.assign(N,0); rawR.assign(N,0);
+                for(int i=0;i<N;i++){rawL[i]=sid[s2f(start+i)]; rawR[i]=sid[s2f(start+N+i)];}
+                return N;
+            }
+        }
+        return -1;
+    };
+
+    struct Combo {
+        bool nopulse,nofilter,noinsvib,fixedparams;
+        std::vector<uint8_t> pptr,filtpt,vibp,vibd,gatec,firstc;
+        std::vector<uint8_t> wtbl_L,wtbl_R,ptbl_L,ptbl_R,ftbl_L,ftbl_R,stbl_L,stbl_R;
+        int N_WTBL=0,N_PTBL=0,N_FTBL=0,N_STBL=0,total=0,diff=INT_MAX;
+        int ncols_try=0;
+    };
+    std::vector<Combo> results;
+    int icols0=icols[0];
+    for(int ncols_try=N_COLS; ncols_try<=N_COLS+1; ncols_try++){
+        int mt_wavetbl_try=icols0+ncols_try*N_INSTR+1;
+        int total_avail=ol_SID-mt_wavetbl_try;
+        if(total_avail<=0) continue;
+
+        int max_w=0; for(auto v:wptr) max_w=std::max(max_w,(int)v); max_w=std::max(max_w,max_wptr_cmd);
+        std::vector<uint8_t> wtbl_L,wtbl_R;
+        int nw=find_jump_consistent_len(mt_wavetbl_try,max_w,total_avail,wtbl_L,wtbl_R);
+#ifdef DEBUG_COLS
+        printf("ncols_try=%d mt_wavetbl=%04x total_avail=%d max_w=%d nw=%d\n",
+               ncols_try,mt_wavetbl_try,total_avail,max_w,nw);
+#endif
+        if(nw<0) continue;
+        int pos1=mt_wavetbl_try+2*nw;
+
+        // STBL "extra zero" pair (one before L, one before R) is emitted only
+        // when WTBL contains an embedded effect command (0xF0-0xFE), per
+        // greloc.c's (!novib)||(!nofunktempo)||(!noportamento)||(!notoneporta).
+        bool wtbl_has_wavecmd=false;
+        for(uint8_t v:wtbl_L) if(v>=0xf0&&v<=0xfe) wtbl_has_wavecmd=true;
+        int stbl_zeros=wtbl_has_wavecmd?2:0;
+
+        for(int a=0;a<=1;a++) for(int b=0;b<=1;b++) for(int c=0;c<=1;c++) for(int d=0;d<=1;d++){
+            if(3+a+b+2*c+2*d!=ncols_try) continue;
+            Combo R;
+            R.wtbl_L=wtbl_L; R.wtbl_R=wtbl_R; R.N_WTBL=nw;
+            int ci=3;
+            R.pptr  = a? read_col(ci++) : std::vector<uint8_t>(N_INSTR,0);
+            R.filtpt= b? read_col(ci++) : std::vector<uint8_t>(N_INSTR,0);
+            if(c){ R.vibp=read_col(ci++); R.vibd=read_col(ci++); } else { R.vibp.assign(N_INSTR,0); R.vibd.assign(N_INSTR,0); }
+            if(d){ R.gatec=read_col(ci++); R.firstc=read_col(ci++); } else { R.gatec.assign(N_INSTR,0); R.firstc.assign(N_INSTR,0); }
+
+            int max_p=0; for(auto v:R.pptr) max_p=std::max(max_p,(int)v); max_p=std::max(max_p,max_pptr_cmd);
+            int max_f=0; for(auto v:R.filtpt) max_f=std::max(max_f,(int)v); max_f=std::max(max_f,max_fptr_cmd);
+            int max_s=0; for(auto v:R.vibp) max_s=std::max(max_s,(int)v); max_s=std::max(max_s,max_stbl_cmd);
+
+            // Table EXISTENCE (nopulse/nofilter) is content-derived: a column
+            // can exist in the instrument-data layout (a/b above) yet still be
+            // all-zero, in which case greloc.c never emits that table at all.
+            R.nopulse=(max_p==0); R.nofilter=(max_f==0);
+            R.noinsvib=!c; R.fixedparams=!d;
+
+            int pos=pos1;
+            int np=0,nf=0;
+            std::vector<uint8_t> ptbl_L,ptbl_R,ftbl_L,ftbl_R;
+            if(!R.nopulse){
+                np=find_jump_consistent_len(pos,max_p,ol_SID-pos,ptbl_L,ptbl_R);
+#ifdef DEBUG_COLS
+                printf("  a=%d b=%d c=%d d=%d pos=%04x max_p=%d np=%d\n",a,b,c,d,pos,max_p,np);
+#endif
+                if(np<0) continue;
+                pos+=2*np;
+            }
+            if(!R.nofilter){
+                nf=find_jump_consistent_len(pos,max_f,ol_SID-pos,ftbl_L,ftbl_R);
+#ifdef DEBUG_COLS
+                printf("  a=%d b=%d c=%d d=%d pos=%04x max_f=%d nf=%d\n",a,b,c,d,pos,max_f,nf);
+#endif
+                if(nf<0) continue;
+                pos+=2*nf;
+            }
+            int remaining=ol_SID-pos-stbl_zeros;
+            if(remaining<0||remaining%2!=0) continue;
+            int ns=remaining/2;
+            R.ptbl_L=ptbl_L; R.ptbl_R=ptbl_R; R.ftbl_L=ftbl_L; R.ftbl_R=ftbl_R;
+            R.N_PTBL=np; R.N_FTBL=nf; R.N_STBL=ns;
+            R.stbl_L.assign(ns,0); R.stbl_R.assign(ns,0);
+            for(int i=0;i<ns;i++){int f=s2f(pos+stbl_zeros/2+i);if(inb(f))R.stbl_L[i]=sid[f];
+                                   int g=s2f(pos+stbl_zeros+ns+i);if(inb(g))R.stbl_R[i]=sid[g];}
+            R.ncols_try=ncols_try;
+            R.total=2*(nw+np+nf+ns)+stbl_zeros; R.diff=0;
+#ifdef DEBUG_COLS
+            printf("  combo a=%d b=%d c=%d d=%d nopulse=%d nofilter=%d : N=%d,%d,%d,%d stbl_zeros=%d max_s=%d\n",
+                   a,b,c,d,(int)R.nopulse,(int)R.nofilter,R.N_WTBL,R.N_PTBL,R.N_FTBL,R.N_STBL,stbl_zeros,max_s);
+#endif
+            results.push_back(R);
+        }
+    }
+    if(results.empty()){fprintf(stderr,"No self-consistent table layout found\n");return 1;}
+#ifdef DEBUG_COLS
+    printf("max_cmd: wptr=%d pptr=%d fptr=%d stbl=%d  (results=%zu)\n",max_wptr_cmd,max_pptr_cmd,max_fptr_cmd,max_stbl_cmd,results.size());
+    for(auto&R:results) printf("  combo ncols=%d nopulse=%d nofilter=%d noinsvib=%d fixedparams=%d : N=%d,%d,%d,%d\n",
+        R.ncols_try,(int)R.nopulse,(int)R.nofilter,(int)R.noinsvib,(int)R.fixedparams,R.N_WTBL,R.N_PTBL,R.N_FTBL,R.N_STBL);
+#endif
+    std::sort(results.begin(),results.end(),[&](const Combo&x,const Combo&y){
+        // Prefer layouts where the speedtable is large enough to cover the
+        // highest STBL index referenced by pattern commands.
+        bool xs=x.N_STBL>=max_stbl_cmd, ys=y.N_STBL>=max_stbl_cmd;
+        if(xs!=ys) return xs>ys;
+        return x.noinsvib<y.noinsvib;
+    });
+    Combo &best=results[0];
+    printf("Layout: nopulse=%d nofilter=%d noinsvib=%d fixedparams=%d (diff=%d)\n",
+           (int)best.nopulse,(int)best.nofilter,(int)best.noinsvib,(int)best.fixedparams,best.diff);
+    printf("WTBL: N=%d  PTBL: N=%d  FTBL: N=%d  STBL: N=%d\n",best.N_WTBL,best.N_PTBL,best.N_FTBL,best.N_STBL);
+
+    bool nopulse=best.nopulse, nofilter=best.nofilter, noinsvib=best.noinsvib, fixedparams=best.fixedparams;
+    (void)nopulse; (void)nofilter; (void)noinsvib;
+    int N_WTBL=best.N_WTBL, N_PTBL=best.N_PTBL, N_FTBL=best.N_FTBL, N_STBL=best.N_STBL;
+
+    // ── Detect nowavedelay from raw WTBL_L ─────────────────────────────────────
+    bool nowavedelay=true;
+    { bool dir=false,shft=false;
+      for(uint8_t v:best.wtbl_L){if(v==0x41||v==0x81)dir=true;if(v==0x51||v==0x91)shft=true;}
+      if(!dir&&shft) nowavedelay=false; }
+    printf("nowavedelay=%d\n",(int)nowavedelay);
 
     // ── fixedparams: scan player for GATETIMERPARAM and FIRSTWAVEPARAM ───────
     uint8_t fp_gate=6, fp_first=0x09;
@@ -207,105 +418,13 @@ int main(int argc, char *argv[]) {
         printf("fixedparams: gate=%02x firstwave=%02x\n",fp_gate,fp_first);
     }
 
-    // ── Read WTBL and PTBL ────────────────────────────────────────────────────
-    std::vector<uint8_t> wtbl_l(N_WTBL),wtbl_r(N_WTBL),ptbl_l(N_PTBL),ptbl_r(N_PTBL);
-    for(int k=0;k<N_WTBL;k++){uint8_t lb=sid[s2f(mt_wavetbl+k)],rb=sid[s2f(mt_notetbl+k)];wtbl_l[k]=wtbl_l_inv(lb,nowavedelay);wtbl_r[k]=wtbl_r_inv(rb,lb);}
-    for(int k=0;k<N_PTBL;k++){ptbl_l[k]=sid[s2f(mt_ptbl+k)];ptbl_r[k]=sid[s2f(mt_pulsespd+k)];}
-
-    // ── Find song and pattern tables from player code ─────────────────────────
-    // Signature: LDA tbl_lo,Y / STA zp / LDA tbl_hi,Y / STA zp
-    // Orderlist variant has LDA (zp),Y / CMP #$FF after; pattern variant doesn't.
-    int mt_songtbllo=-1,mt_songtblhi=-1,mt_patttbllo=-1,mt_patttblhi=-1;
-    for(int i=0;i<code_len-20&&(mt_songtbllo<0||mt_patttbllo<0);i++){
-        if(code[i]!=0xB9) continue;
-        int a1=code[i+1]|(code[i+2]<<8);
-        if(a1<la||a1>=la+code_len) continue;
-        if(code[i+3]!=0x85) continue;
-        uint8_t zp1=code[i+4];
-        for(int j=i+5;j<i+14&&j+4<code_len;j++){
-            if(code[j]!=0xB9) continue;
-            int a2=code[j+1]|(code[j+2]<<8);
-            if(a2<=a1||a2>=la+code_len) continue;
-            if(code[j+3]!=0x85) continue;
-            bool has_ol=false;
-            for(int k=j+5;k<j+40&&k+3<code_len;k++)
-                if(code[k]==0xB1&&code[k+1]==zp1&&code[k+2]==0xC9&&code[k+3]==0xFF){has_ol=true;break;}
-            if(has_ol&&mt_songtbllo<0){mt_songtbllo=a1;mt_songtblhi=a2;}
-            else if(!has_ol&&mt_patttbllo<0){mt_patttbllo=a1;mt_patttblhi=a2;}
-            break;
-        }
-    }
-    if(mt_songtbllo<0||mt_patttbllo<0){fprintf(stderr,"Could not find song/pattern tables in 6502 code\n");return 1;}
-
-    int n_songs_v=(mt_songtblhi-mt_songtbllo)/3;
-    int n_patts_v=mt_patttblhi-mt_patttbllo;
-    int mt_insad_v=mt_patttblhi+n_patts_v;
-
-    // Refine instrument cluster using definitive mt_insad
-    {
-        std::vector<int> ic2;
-        for(auto&[sa,co]:cl) if(sa>=mt_insad_v-1) ic2.push_back(sa);
-        if(ic2.size()>=2){
-            icols=ic2; N_COLS=(int)icols.size()-1; N_INSTR=icols[1]-icols[0];
-            mt_wavetbl=icols.back()+1;
-            nopulse=(N_PTBL==0);
-            {int rem=N_COLS-3-(nopulse?0:1);nofilter=(rem<5);if(!nofilter)rem--;noinsvib=(rem<2);fixedparams=(noinsvib?(rem<2):(rem<4));}
-            ci=0;
-            adc=read_col(ci++); sr=read_col(ci++); wptr=read_col(ci++);
-            pptr  =nopulse  ?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-            filtpt=nofilter ?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-            vibp  =noinsvib ?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-            vibd  =noinsvib ?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-            gatec =fixedparams?std::vector<uint8_t>(N_INSTR,0):read_col(ci++);
-            firstc=fixedparams?std::vector<uint8_t>(N_INSTR,0):read_col(ci);
-            printf("N_INSTR=%d  N_COLS=%d  mt_wavetbl=SID %04x (refined)\n",N_INSTR,N_COLS,mt_wavetbl);
-        }
-    }
-
-    int ol_file=flen;
-    for(int c=0;c<n_songs_v*3;c++){int lo=sid[s2f(mt_songtbllo+c)],hi=sid[s2f(mt_songtblhi+c)];int af=s2f((hi<<8)|lo);if(af>=ds&&af<flen)ol_file=std::min(ol_file,af);}
-    if(ol_file>=flen){fprintf(stderr,"Bad song table addresses\n");return 1;}
-    printf("Orderlists at file %04x\n",ol_file);
-    int ol_SID=f2s(ol_file);
-    int ptbl_end_SID=mt_pulsespd+N_PTBL;
-
-    // ── Locate FTBL and STBL from LDA abs,Y accesses in the table gap ────────
-    // greloc layout: FTBL_L | FTBL_R | [0x00] STBL_L [0x00] STBL_R
-    // All four table bases appear as LDA abs,Y in the player; their base-1
-    // addresses land in the gap [ptbl_end_SID, ol_SID).
-    // N_FTBL = a2-a1+1  (a1=FTBL_L base, a2=FTBL_R base-1, inclusive span)
-    // N_STBL = a4-a3-1  (a3=STBL_L base-1 / separator, a4=STBL_R base-1)
-    int N_FTBL=0,N_STBL=0;
-    int mt_ftbl=0,mt_ftblspd=0,mt_speedlefttbl=0,mt_speedrighttbl=0;
-    {
-        std::vector<int> gap;
-        for(auto&[sa,cnt]:acnt) if(sa>=ptbl_end_SID&&sa<ol_SID) gap.push_back(sa);
-        std::sort(gap.begin(),gap.end());
-        if(gap.size()>=4){
-            int a1=gap[0],a2=gap[1],a3=gap[gap.size()-2],a4=gap.back();
-            N_FTBL=a2-a1+1; mt_ftbl=a1; mt_ftblspd=a2+1;
-            N_STBL=a4-a3-1; mt_speedlefttbl=a3+1; mt_speedrighttbl=a4+1;
-        } else if(gap.size()==2){
-            int a3=gap[0],a4=gap[1];
-            N_STBL=a4-a3-1; mt_speedlefttbl=a3+1; mt_speedrighttbl=a4+1;
-        } else if(gap.size()==1){
-            mt_speedrighttbl=gap[0]+1; N_STBL=ol_SID-mt_speedrighttbl;
-        }
-        printf("FTBL: N=%d ltable=SID %04x rtable=SID %04x\n",N_FTBL,mt_ftbl,mt_ftblspd);
-        printf("STBL: N=%d ltable=SID %04x rtable=SID %04x\n",N_STBL,mt_speedlefttbl,mt_speedrighttbl);
-
-        if(N_FTBL==0) nofilter=true;
-        if(N_STBL==0) noinsvib=true;
-        // nofilter may have been set conservatively (N_COLS<8) even when a filter
-        // table exists. Re-read the filter pointer column now that N_FTBL is known.
-        if(nofilter&&N_FTBL>0&&!icols.empty()){
-            nofilter=false;
-            int fc=3+(nopulse?0:1);
-            if(fc<(int)icols.size()) for(int i=0;i<N_INSTR;i++) filtpt[i]=sid[s2f(icols[fc]+1+i)];
-        }
-        if(nofilter)  for(int i=0;i<N_INSTR;i++) filtpt[i]=0;
-        if(noinsvib){ for(int i=0;i<N_INSTR;i++) vibp[i]=vibd[i]=0; }
-    }
+    // ── Apply inverse transforms ────────────────────────────────────────────────
+    std::vector<uint8_t> wtbl_l(N_WTBL),wtbl_r(N_WTBL);
+    for(int k=0;k<N_WTBL;k++){wtbl_l[k]=wtbl_l_inv(best.wtbl_L[k],nowavedelay); wtbl_r[k]=wtbl_r_inv(best.wtbl_R[k],best.wtbl_L[k]);}
+    std::vector<uint8_t> &ptbl_l=best.ptbl_L, &ptbl_r=best.ptbl_R;
+    std::vector<uint8_t> ftbl_l(N_FTBL),ftbl_r(N_FTBL);
+    for(int k=0;k<N_FTBL;k++){ftbl_l[k]=ftbl_l_inv(best.ftbl_L[k]); ftbl_r[k]=best.ftbl_R[k];}
+    std::vector<uint8_t> &stbl_l=best.stbl_L, &stbl_r=best.stbl_R;
 
     // ── Build SNG ─────────────────────────────────────────────────────────────
     gt::Song song; memset(&song,0,sizeof(song));
@@ -316,68 +435,37 @@ int main(int argc, char *argv[]) {
     for(int i=0;i<32;i++){song.authorname[i]  =(0x36+i<ds)?sid[0x36+i]:0;}
     for(int i=0;i<32;i++){song.copyrightname[i]=(0x56+i<ds)?sid[0x56+i]:0;}
 
-    // WTBL and PTBL: direct copy after inverse transforms
     for(int k=0;k<N_WTBL;k++){song.ltable[gt::WTBL][k]=wtbl_l[k];song.rtable[gt::WTBL][k]=wtbl_r[k];}
     for(int k=0;k<N_PTBL;k++){song.ltable[gt::PTBL][k]=ptbl_l[k];song.rtable[gt::PTBL][k]=ptbl_r[k];}
+    for(int k=0;k<N_FTBL;k++){song.ltable[gt::FTBL][k]=ftbl_l[k];song.rtable[gt::FTBL][k]=ftbl_r[k];}
+    for(int k=0;k<N_STBL;k++){song.ltable[gt::STBL][k]=stbl_l[k];song.rtable[gt::STBL][k]=stbl_r[k];}
 
-    // FTBL: all N_FTBL entries stored verbatim from the binary.
-    // L: inverse passband transform for mode bytes (>0x80, ≠0xFF).
-    // R: verbatim (stop=0x00, loop targets, routing bytes all kept as-is).
-    // Fptrs and CMD args also stored verbatim (binary compact indices).
-    // This produces an identity tablemap when GTUltra recompiles: all entries
-    // are seeded via the existing fptrs/CMDs, so the output binary is identical.
-    if(N_FTBL>0&&mt_ftbl>0){
-        for(int k=1;k<=N_FTBL&&k<=gt::MAX_TABLELEN;k++){
-            uint8_t bl=sid[s2f(mt_ftbl+k-1)], br=sid[s2f(mt_ftblspd+k-1)];
-            song.ltable[gt::FTBL][k-1]=ftbl_l_inv(bl);
-            song.rtable[gt::FTBL][k-1]=br;
-        }
-        for(int i=0;i<N_INSTR;i++){int fp=filtpt[i];if(fp<1||fp>N_FTBL)filtpt[i]=0;}
-
-        for(int p=0;p<n_patts_v&&p<gt::MAX_PATT;p++){
-            int lo=sid[s2f(mt_patttbllo+p)],hi=sid[s2f(mt_patttblhi+p)];
-            int pf=s2f((hi<<8)|lo);
-            if(pf<ds||pf>=flen){song.pattlen[p]=0;continue;}
-            int rows=unpack_patt(song.pattern[p],sid,pf,flen);
-            song.pattlen[p]=rows; song.highestusedpattern=p;
-        }
-    }
-
-    // STBL: direct copy (no transform)
-    if(N_STBL>0&&mt_speedrighttbl>0){
-        int stbl_l=mt_speedrighttbl-N_STBL-1;
-        for(int k=0;k<N_STBL&&k<gt::MAX_TABLELEN;k++){
-            song.ltable[gt::STBL][k]=sid[s2f(stbl_l+k)];
-            song.rtable[gt::STBL][k]=sid[s2f(mt_speedrighttbl+k)];
-        }
-    }
-
-    // Patterns for songs with no filter table
-    if(N_FTBL==0){
-        for(int p=0;p<n_patts_v&&p<gt::MAX_PATT;p++){
-            int lo=sid[s2f(mt_patttbllo+p)],hi=sid[s2f(mt_patttblhi+p)];
-            int pf=s2f((hi<<8)|lo);
-            if(pf<ds||pf>=flen){song.pattlen[p]=0;continue;}
-            int rows=unpack_patt(song.pattern[p],sid,pf,flen);
-            song.pattlen[p]=rows; song.highestusedpattern=p;
-        }
+    // ── Patterns (already unpacked above, independent of table addresses) ─────
+    for(int p=0;p<=highest_patt&&p<gt::MAX_PATT;p++){
+        if(patt_len[p]<=0) continue;
+        memcpy(song.pattern[p],patt_data[p].data(),(gt::MAX_PATTROWS*4+4));
+        song.pattlen[p]=patt_len[p];
+        song.highestusedpattern=p;
     }
 
     // ── Instruments ───────────────────────────────────────────────────────────
     song.highestusedinstr=N_INSTR;
     for(int i=0;i<N_INSTR;i++){
         int idx=i+1;
-        uint8_t vd=(vibd[i]>0)?(uint8_t)(vibd[i]+1):0;
-        if(vibp[i]>0&&vd==0) vd=1;
+        int fp=best.filtpt[i]; if(fp<1||fp>N_FTBL) fp=0;
+        int vp=best.vibp[i];   if(vp<1||vp>N_STBL) vp=0;
+        int pp=best.pptr[i];   if(pp<1||pp>N_PTBL) pp=0;
+        uint8_t vd=(best.vibd[i]>0)?(uint8_t)(best.vibd[i]+1):0;
+        if(vp>0&&vd==0) vd=1;
         song.instr[idx].ad        =adc[i];
-        song.instr[idx].sr        =sr[i];
-        song.instr[idx].gatetimer =fixedparams?fp_gate:gatec[i];
-        song.instr[idx].firstwave =fixedparams?fp_first:firstc[i];
+        song.instr[idx].sr        =srv[i];
+        song.instr[idx].gatetimer =fixedparams?fp_gate:best.gatec[i];
+        song.instr[idx].firstwave =fixedparams?fp_first:best.firstc[i];
         song.instr[idx].vibdelay  =vd;
-        song.instr[idx].ptr[gt::STBL]=vibp[i];
-        song.instr[idx].ptr[gt::FTBL]=filtpt[i];
+        song.instr[idx].ptr[gt::STBL]=(uint8_t)vp;
+        song.instr[idx].ptr[gt::FTBL]=(uint8_t)fp;
         song.instr[idx].ptr[gt::WTBL]=wptr[i];
-        song.instr[idx].ptr[gt::PTBL]=pptr[i];
+        song.instr[idx].ptr[gt::PTBL]=(uint8_t)pp;
     }
 
     // ── Orderlists ────────────────────────────────────────────────────────────
