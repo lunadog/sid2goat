@@ -15,13 +15,13 @@
 // CMD_SETTEMPO: binary arg = sng_arg-1 (for sng_arg≥3) → inverse: +1 if ≥2.
 static int unpack_patt(uint8_t *out, const uint8_t *data, int off, int maxlen) {
     int pos=off, row=0;
-    uint8_t cur_instr=0, cmd=0, arg=0;
+    uint8_t cmd=0, arg=0;
     while (row<gt::MAX_PATTROWS && pos<maxlen) {
         uint8_t b=data[pos++];
         if (b==0x00) break;
         uint8_t row_instr=0;
         if (b<gt::FX) {
-            cur_instr=b; row_instr=b;
+            row_instr=b;
             if(pos>=maxlen) break;
             b=data[pos++];
             if(b==0x00) break;
@@ -43,7 +43,7 @@ static int unpack_patt(uint8_t *out, const uint8_t *data, int off, int maxlen) {
                 out[row*4+0]=gt::REST; out[row*4+1]=0; out[row*4+2]=cmd; out[row*4+3]=arg;
             }
         } else {
-            uint8_t oi=(b!=gt::REST)?(row_instr?row_instr:cur_instr):0;
+            uint8_t oi=(b!=gt::REST)?row_instr:0;
             out[row*4+0]=b; out[row*4+1]=oi; out[row*4+2]=cmd; out[row*4+3]=arg; row++;
         }
     }
@@ -71,6 +71,23 @@ static uint8_t wtbl_r_inv(uint8_t r, uint8_t l_bin) {
 static uint8_t ftbl_l_inv(uint8_t b) {
     if (b!=0xff&&b>0x80) return (uint8_t)(0x80|((b&0x7f)<<1));
     return b;
+}
+
+// ── makespeedtable (gtable.c) ───────────────────────────────────────────────
+// Converts a raw speed/vibrato byte (as stored verbatim by legacy v2.0-style
+// binaries, both per-instrument and as pattern cmd1-4/14 args) into an
+// (l,r) STBL entry. data==0 means "no entry" (resulting index 0).
+enum { MST_NOFINEVIB=0, MST_FINEVIB=1, MST_FUNKTEMPO=2, MST_PORTAMENTO=3 };
+static bool make_speed_lr(uint8_t data, int mode, uint8_t &l, uint8_t &r) {
+    if (!data) return false;
+    switch (mode) {
+        case MST_NOFINEVIB: l=(data&0xf0)>>4; r=(data&0x0f)<<4; break;
+        case MST_FINEVIB:   l=(data&0x70)>>4; r=(uint8_t)(((data&0x0f)<<4)|((data&0x80)>>4)); break;
+        case MST_FUNKTEMPO: l=(data&0xf0)>>4; r=data&0x0f; break;
+        case MST_PORTAMENTO:{int temp=((int)data<<2)&0xffff; l=(uint8_t)(temp>>8); r=(uint8_t)(temp&0xff);} break;
+        default: return false;
+    }
+    return true;
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -295,12 +312,25 @@ int main(int argc, char *argv[]) {
         std::vector<uint8_t> wtbl_L,wtbl_R,ptbl_L,ptbl_R,ftbl_L,ftbl_R,stbl_L,stbl_R;
         int N_WTBL=0,N_PTBL=0,N_FTBL=0,N_STBL=0,total=0,diff=INT_MAX;
         int ncols_try=0;
+        bool legacy_format=false;
     };
     std::vector<Combo> results;
     int icols0=icols[0];
     for(int ncols_try=N_COLS; ncols_try<=N_COLS+1; ncols_try++){
         int mt_wavetbl_try=icols0+ncols_try*N_INSTR+1;
-        int total_avail=ol_SID-mt_wavetbl_try;
+        // The table region ends at whichever known structure (songtbl/patttbl
+        // pointer arrays, or the orderlist data itself) comes first after
+        // mt_wavetbl_try. In some layouts (e.g. early relocators) the pointer
+        // arrays sit between the tables and the orderlist data; in others they
+        // precede the instrument cluster entirely and don't constrain this.
+        // When a pointer array is the binding constraint, this is the older
+        // (v2.0-style) relocator layout, which also stores WTBL/FTBL verbatim
+        // (no XOR/wave-delay/filter-cutoff transforms) and has no STBL section.
+        int region_end=ol_SID;
+        bool legacy_format=false;
+        for(int addr:{mt_songtbllo,mt_songtblhi,mt_patttbllo,mt_patttblhi})
+            if(addr>mt_wavetbl_try&&addr<region_end){region_end=addr;legacy_format=true;}
+        int total_avail=region_end-mt_wavetbl_try;
         if(total_avail<=0) continue;
 
         int max_w=0; for(auto v:wptr) max_w=std::max(max_w,(int)v); max_w=std::max(max_w,max_wptr_cmd);
@@ -312,13 +342,6 @@ int main(int argc, char *argv[]) {
 #endif
         if(nw<0) continue;
         int pos1=mt_wavetbl_try+2*nw;
-
-        // STBL "extra zero" pair (one before L, one before R) is emitted only
-        // when WTBL contains an embedded effect command (0xF0-0xFE), per
-        // greloc.c's (!novib)||(!nofunktempo)||(!noportamento)||(!notoneporta).
-        bool wtbl_has_wavecmd=false;
-        for(uint8_t v:wtbl_L) if(v>=0xf0&&v<=0xfe) wtbl_has_wavecmd=true;
-        int stbl_zeros=wtbl_has_wavecmd?2:0;
 
         for(int a=0;a<=1;a++) for(int b=0;b<=1;b++) for(int c=0;c<=1;c++) for(int d=0;d<=1;d++){
             if(3+a+b+2*c+2*d!=ncols_try) continue;
@@ -334,6 +357,14 @@ int main(int argc, char *argv[]) {
             int max_f=0; for(auto v:R.filtpt) max_f=std::max(max_f,(int)v); max_f=std::max(max_f,max_fptr_cmd);
             int max_s=0; for(auto v:R.vibp) max_s=std::max(max_s,(int)v); max_s=std::max(max_s,max_stbl_cmd);
 
+            // STBL "extra zero" pair (one before L, one before R) is emitted
+            // only when the song actually uses vibrato/portamento/toneporta/
+            // funktempo (greloc.c: (!novib)||(!nofunktempo)||(!noportamento)||
+            // (!notoneporta)) -- approximated here by max_s>0 (an instrument's
+            // STBL pointer or a pattern cmd1-4/14 arg references the table).
+            // Legacy (v2.0-style) binaries have no STBL section at all.
+            int stbl_zeros=(!legacy_format&&max_s>0)?2:0;
+
             // Table EXISTENCE (nopulse/nofilter) is content-derived: a column
             // can exist in the instrument-data layout (a/b above) yet still be
             // all-zero, in which case greloc.c never emits that table at all.
@@ -344,7 +375,7 @@ int main(int argc, char *argv[]) {
             int np=0,nf=0;
             std::vector<uint8_t> ptbl_L,ptbl_R,ftbl_L,ftbl_R;
             if(!R.nopulse){
-                np=find_jump_consistent_len(pos,max_p,ol_SID-pos,ptbl_L,ptbl_R);
+                np=find_jump_consistent_len(pos,max_p,region_end-pos,ptbl_L,ptbl_R);
 #ifdef DEBUG_COLS
                 printf("  a=%d b=%d c=%d d=%d pos=%04x max_p=%d np=%d\n",a,b,c,d,pos,max_p,np);
 #endif
@@ -352,14 +383,14 @@ int main(int argc, char *argv[]) {
                 pos+=2*np;
             }
             if(!R.nofilter){
-                nf=find_jump_consistent_len(pos,max_f,ol_SID-pos,ftbl_L,ftbl_R);
+                nf=find_jump_consistent_len(pos,max_f,region_end-pos,ftbl_L,ftbl_R);
 #ifdef DEBUG_COLS
                 printf("  a=%d b=%d c=%d d=%d pos=%04x max_f=%d nf=%d\n",a,b,c,d,pos,max_f,nf);
 #endif
                 if(nf<0) continue;
                 pos+=2*nf;
             }
-            int remaining=ol_SID-pos-stbl_zeros;
+            int remaining=region_end-pos-stbl_zeros;
             if(remaining<0||remaining%2!=0) continue;
             int ns=remaining/2;
             R.ptbl_L=ptbl_L; R.ptbl_R=ptbl_R; R.ftbl_L=ftbl_L; R.ftbl_R=ftbl_R;
@@ -367,7 +398,7 @@ int main(int argc, char *argv[]) {
             R.stbl_L.assign(ns,0); R.stbl_R.assign(ns,0);
             for(int i=0;i<ns;i++){int f=s2f(pos+stbl_zeros/2+i);if(inb(f))R.stbl_L[i]=sid[f];
                                    int g=s2f(pos+stbl_zeros+ns+i);if(inb(g))R.stbl_R[i]=sid[g];}
-            R.ncols_try=ncols_try;
+            R.ncols_try=ncols_try; R.legacy_format=legacy_format;
             R.total=2*(nw+np+nf+ns)+stbl_zeros; R.diff=0;
 #ifdef DEBUG_COLS
             printf("  combo a=%d b=%d c=%d d=%d nopulse=%d nofilter=%d : N=%d,%d,%d,%d stbl_zeros=%d max_s=%d\n",
@@ -383,16 +414,62 @@ int main(int argc, char *argv[]) {
         R.ncols_try,(int)R.nopulse,(int)R.nofilter,(int)R.noinsvib,(int)R.fixedparams,R.N_WTBL,R.N_PTBL,R.N_FTBL,R.N_STBL);
 #endif
     std::sort(results.begin(),results.end(),[&](const Combo&x,const Combo&y){
-        // Prefer layouts where the speedtable is large enough to cover the
-        // highest STBL index referenced by pattern commands.
-        bool xs=x.N_STBL>=max_stbl_cmd, ys=y.N_STBL>=max_stbl_cmd;
-        if(xs!=ys) return xs>ys;
+        // Prefer layouts that actually populate PTBL/FTBL from real column
+        // data over degenerate (nopulse&&nofilter) layouts that dump the same
+        // bytes into a larger STBL -- the latter only "fits" because a=0,b=0
+        // makes max_p=max_f=0 by construction, regardless of column content.
+        int xt=(!x.nopulse)+(!x.nofilter), yt=(!y.nopulse)+(!y.nofilter);
+        if(xt!=yt) return xt>yt;
         return x.noinsvib<y.noinsvib;
     });
     Combo &best=results[0];
     printf("Layout: nopulse=%d nofilter=%d noinsvib=%d fixedparams=%d (diff=%d)\n",
            (int)best.nopulse,(int)best.nofilter,(int)best.noinsvib,(int)best.fixedparams,best.diff);
     printf("WTBL: N=%d  PTBL: N=%d  FTBL: N=%d  STBL: N=%d\n",best.N_WTBL,best.N_PTBL,best.N_FTBL,best.N_STBL);
+
+    // ── Legacy-format STBL synthesis ────────────────────────────────────────
+    // v2.0-style binaries store NO compiled STBL: per-instrument vibrato is a
+    // raw speed byte, and pattern cmd1-4/14 (PORTAUP/PORTADOWN/TONEPORTA/
+    // VIBRATO/FUNKTEMPO) args are raw speed bytes too. The loader converts
+    // these via makespeedtable(data,mode,makenew=0) -- dedup by (l,r), data==0
+    // means no entry (resulting index 0). We replicate that here so the
+    // GTS5 output has a real STBL and STBL-index pattern args/instrument ptrs.
+    std::vector<uint8_t> legacy_vibdelay(N_INSTR,0), legacy_stblptr(N_INSTR,0);
+    if(best.legacy_format){
+        std::vector<std::pair<uint8_t,uint8_t>> entries;
+        auto stbl_index=[&](uint8_t data,int mode)->int{
+            uint8_t l,r;
+            if(!make_speed_lr(data,mode,l,r)) return 0;
+            for(size_t e=0;e<entries.size();e++) if(entries[e].first==l&&entries[e].second==r) return (int)e+1;
+            if(entries.size()>=gt::MAX_TABLELEN) return 0;
+            entries.push_back({l,r});
+            return (int)entries.size();
+        };
+        // Per-instrument: first column of the (vibdelay,rawvib) pair is the
+        // direct vibdelay value (no transform), the second is the raw
+        // vibrato-speed byte fed through makespeedtable (finevibrato mode).
+        for(int i=0;i<N_INSTR;i++){
+            legacy_vibdelay[i]=best.vibp[i];
+            legacy_stblptr[i]=(uint8_t)stbl_index(best.vibd[i],MST_FINEVIB);
+        }
+        // Pattern commands: PORTAUP/PORTADOWN/TONEPORTA -> portamento mode,
+        // VIBRATO -> finevibrato mode, FUNKTEMPO -> funktempo mode.
+        for(int p=0;p<=highest_patt&&p<gt::MAX_PATT;p++){
+            for(int r=0;r<patt_len[p]&&r<gt::MAX_PATTROWS;r++){
+                uint8_t cmd=patt_data[p][r*4+2];
+                uint8_t &arg=patt_data[p][r*4+3];
+                int mode=-1;
+                if(cmd==gt::CMD_PORTAUP||cmd==gt::CMD_PORTADOWN||cmd==gt::CMD_TONEPORTA) mode=MST_PORTAMENTO;
+                else if(cmd==gt::CMD_VIBRATO) mode=MST_FINEVIB;
+                else if(cmd==gt::CMD_FUNKTEMPO) mode=MST_FUNKTEMPO;
+                if(mode>=0) arg=(uint8_t)stbl_index(arg,mode);
+            }
+        }
+        best.N_STBL=(int)entries.size();
+        best.stbl_L.assign(entries.size(),0); best.stbl_R.assign(entries.size(),0);
+        for(size_t e=0;e<entries.size();e++){best.stbl_L[e]=entries[e].first; best.stbl_R[e]=entries[e].second;}
+        printf("Legacy STBL synthesized: N=%d\n",best.N_STBL);
+    }
 
     bool nopulse=best.nopulse, nofilter=best.nofilter, noinsvib=best.noinsvib, fixedparams=best.fixedparams;
     (void)nopulse; (void)nofilter; (void)noinsvib;
@@ -419,11 +496,20 @@ int main(int argc, char *argv[]) {
     }
 
     // ── Apply inverse transforms ────────────────────────────────────────────────
+    // Older (v2.0-style, legacy_format) relocators store WTBL/FTBL verbatim:
+    // no R^0x80, no wave-delay remap, no filter-cutoff remap. Only v2.73-style
+    // (non-legacy) binaries need these inverses undone.
     std::vector<uint8_t> wtbl_l(N_WTBL),wtbl_r(N_WTBL);
-    for(int k=0;k<N_WTBL;k++){wtbl_l[k]=wtbl_l_inv(best.wtbl_L[k],nowavedelay); wtbl_r[k]=wtbl_r_inv(best.wtbl_R[k],best.wtbl_L[k]);}
+    for(int k=0;k<N_WTBL;k++){
+        wtbl_l[k]=best.legacy_format?best.wtbl_L[k]:wtbl_l_inv(best.wtbl_L[k],nowavedelay);
+        wtbl_r[k]=best.legacy_format?best.wtbl_R[k]:wtbl_r_inv(best.wtbl_R[k],best.wtbl_L[k]);
+    }
     std::vector<uint8_t> &ptbl_l=best.ptbl_L, &ptbl_r=best.ptbl_R;
     std::vector<uint8_t> ftbl_l(N_FTBL),ftbl_r(N_FTBL);
-    for(int k=0;k<N_FTBL;k++){ftbl_l[k]=ftbl_l_inv(best.ftbl_L[k]); ftbl_r[k]=best.ftbl_R[k];}
+    for(int k=0;k<N_FTBL;k++){
+        ftbl_l[k]=best.legacy_format?best.ftbl_L[k]:ftbl_l_inv(best.ftbl_L[k]);
+        ftbl_r[k]=best.ftbl_R[k];
+    }
     std::vector<uint8_t> &stbl_l=best.stbl_L, &stbl_r=best.stbl_R;
 
     // ── Build SNG ─────────────────────────────────────────────────────────────
@@ -453,10 +539,16 @@ int main(int argc, char *argv[]) {
     for(int i=0;i<N_INSTR;i++){
         int idx=i+1;
         int fp=best.filtpt[i]; if(fp<1||fp>N_FTBL) fp=0;
-        int vp=best.vibp[i];   if(vp<1||vp>N_STBL) vp=0;
         int pp=best.pptr[i];   if(pp<1||pp>N_PTBL) pp=0;
-        uint8_t vd=(best.vibd[i]>0)?(uint8_t)(best.vibd[i]+1):0;
-        if(vp>0&&vd==0) vd=1;
+        uint8_t vd; int vp;
+        if(best.legacy_format){
+            vd=legacy_vibdelay[i];
+            vp=legacy_stblptr[i];
+        } else {
+            vp=best.vibp[i];   if(vp<1||vp>N_STBL) vp=0;
+            vd=best.vibd[i];
+            if(vp>0&&vd==0) vd=1;
+        }
         song.instr[idx].ad        =adc[i];
         song.instr[idx].sr        =srv[i];
         song.instr[idx].gatetimer =fixedparams?fp_gate:best.gatec[i];
