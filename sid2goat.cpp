@@ -546,7 +546,10 @@ int main(int argc, char *argv[]) {
             vp=legacy_stblptr[i];
         } else {
             vp=best.vibp[i];   if(vp<1||vp>N_STBL) vp=0;
-            vd=best.vibd[i];
+            // GT2.73's relocator writes vibdelay-1 to the compiled SID
+            // (greloc.c: "instrwork[...]=instr[c].vibdelay-1" when nonzero),
+            // so the .sng/editor value is the compiled byte plus one.
+            vd=(best.vibd[i]>0)?(uint8_t)(best.vibd[i]+1):0;
             if(vp>0&&vd==0) vd=1;
         }
         song.instr[idx].ad        =adc[i];
