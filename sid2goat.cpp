@@ -463,6 +463,28 @@ int main(int argc, char *argv[]) {
     }
     printf("firstwave_evidence=%d\n",firstwave_evidence);
 
+    // ── Detect ptbl_evidence from player code ──────────────────────────────────
+    // The PTBL is processed per-channel (X-register = channel offset), so any
+    // LDA (ptbl_start-1),Y in the player will be surrounded by abs,X instructions
+    // (BD/9D/BC). The FTBL is processed globally (no X indexing). Use this to
+    // break the tie between nopulse=false (PTBL at WTBL_end) and nopulse=true
+    // (no PTBL, FTBL starts at WTBL_end) when both are structurally valid.
+    int ptbl_evidence=-1; // -1=unknown, 0=no real PTBL, 1=real PTBL at WTBL_end
+    for(auto&r:results){
+        if(r.nopulse) continue; // only check combos claiming a PTBL
+        int ptbl_start=icols0+r.ncols_try*N_INSTR+1+2*r.N_WTBL;
+        uint8_t tlo=(ptbl_start-1)&0xff, thi=((ptbl_start-1)>>8)&0xff;
+        for(int i=0;i<code_len-2&&ptbl_evidence<0;i++){
+            if(code[i]==0xB9&&code[i+1]==tlo&&code[i+2]==thi){
+                int lo=std::max(0,i-8),hi=std::min(code_len-1,i+8);
+                for(int j=lo;j<=hi;j++)
+                    if(code[j]==0xBD||code[j]==0x9D||code[j]==0xBC){ptbl_evidence=1;break;}
+                if(ptbl_evidence<0) ptbl_evidence=0;
+            }
+        }
+    }
+    printf("ptbl_evidence=%d\n",ptbl_evidence);
+
     std::sort(results.begin(),results.end(),[&](const Combo&x,const Combo&y){
         // Prefer layouts that actually populate PTBL/FTBL from real column
         // data over degenerate (nopulse&&nofilter) layouts that dump the same
@@ -470,6 +492,12 @@ int main(int argc, char *argv[]) {
         // makes max_p=max_f=0 by construction, regardless of column content.
         int xt=(!x.nopulse)+(!x.nofilter), yt=(!y.nopulse)+(!y.nofilter);
         if(xt!=yt) return xt>yt;
+        // Use disassembly evidence to distinguish pulse (per-channel, X-indexed)
+        // from filter (global) table when total optional-table count is equal.
+        if(x.nopulse!=y.nopulse){
+            if(ptbl_evidence==1) return !x.nopulse; // prefer nopulse=false (real PTBL)
+            if(ptbl_evidence==0) return x.nopulse;  // prefer nopulse=true (no PTBL)
+        }
         if(x.noinsvib!=y.noinsvib){
             // evidence=1 (table read → real firstwave column) → prefer noinsvib=true
             if(firstwave_evidence==1) return x.noinsvib>y.noinsvib;
@@ -601,12 +629,9 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
-        // Legacy (v2.0/v2.06) always uses BMI polarity: override any false-positive BPL
-        // pickup caused by unrelated branches in the wave-exec body.
-        if(best.legacy_format) wtbl_r_needs_xor=false;
         printf("WTBL R-byte polarity: %s\n",
-               found_branch>0&&!best.legacy_format?"bpl/inverted (xor applied)":
-               found_branch<0||best.legacy_format?"bmi/standard (verbatim)":
+               found_branch>0?"bpl/inverted (xor applied)":
+               found_branch<0?"bmi/standard (verbatim)":
                "not found in player code (defaulting to verbatim)");
         printf("nowavedelay=%d\n",(int)nowavedelay);
     }
