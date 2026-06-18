@@ -141,11 +141,20 @@ int main(int argc, char *argv[]) {
     for (int s=0;s<(int)da.size()-2;s++) {
         int g=da[s+1].first-da[s].first;
         if(g<=0||g>64) continue;
-        int n=2;
-        while(s+n<(int)da.size()&&da[s+n].first-da[s+n-1].first==g) n++;
-        int cmin=da[s].second,cmax=da[s].second;
-        for(int k=1;k<n;k++){cmin=std::min(cmin,da[s+k].second);cmax=std::max(cmax,da[s+k].second);}
-        if(cmax-cmin<=300&&n>best_n){best_s=s;best_g=g;best_n=n;}
+        // Extend the run only while the running (cmin,cmax) window over
+        // included code-offsets stays within range -- a coincidentally
+        // address-aligned byte belonging to an unrelated table (e.g. an
+        // effect/speed lookup elsewhere in the code) will typically have a
+        // code offset far from the genuine column cluster, and should stop
+        // the run rather than invalidate it.
+        int n=1,cmin=da[s].second,cmax=da[s].second;
+        while(s+n<(int)da.size()&&da[s+n].first-da[s+n-1].first==g){
+            int nc=da[s+n].second;
+            int ncmin=std::min(cmin,nc), ncmax=std::max(cmax,nc);
+            if(ncmax-ncmin>300) break;
+            cmin=ncmin; cmax=ncmax; n++;
+        }
+        if(n>=2&&n>best_n){best_s=s;best_g=g;best_n=n;}
     }
     std::vector<std::pair<int,int>> cl;
     for(int k=0;k<best_n;k++) cl.push_back({da[best_s+k].first,da[best_s+k].second});
@@ -216,6 +225,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if(icols.empty()){fprintf(stderr,"Could not locate instrument-cluster columns\n");return 1;}
     auto read_col=[&](int ci)->std::vector<uint8_t>{
         std::vector<uint8_t> v(N_INSTR,0);
         int base=icols[0]+ci*N_INSTR;
@@ -316,7 +326,12 @@ int main(int argc, char *argv[]) {
     };
     std::vector<Combo> results;
     int icols0=icols[0];
-    for(int ncols_try=N_COLS; ncols_try<=N_COLS+1; ncols_try++){
+    // 9 is the theoretical maximum: 3 always-present columns (AD,SR,wave)
+    // plus up to 6 optional ones (pulse,filter,vibptr+vibdelay,gatetimer+
+    // firstwave). Some binaries reserve the full fixed-size instrument
+    // layout regardless of which fields any code path actually touches, so
+    // a real column can exist with no live LDA reference to find it by.
+    for(int ncols_try=N_COLS; ncols_try<=9; ncols_try++){
         int mt_wavetbl_try=icols0+ncols_try*N_INSTR+1;
         // The table region ends at whichever known structure (songtbl/patttbl
         // pointer arrays, or the orderlist data itself) comes first after
@@ -413,6 +428,41 @@ int main(int argc, char *argv[]) {
     for(auto&R:results) printf("  combo ncols=%d nopulse=%d nofilter=%d noinsvib=%d fixedparams=%d : N=%d,%d,%d,%d\n",
         R.ncols_try,(int)R.nopulse,(int)R.nofilter,(int)R.noinsvib,(int)R.fixedparams,R.N_WTBL,R.N_PTBL,R.N_FTBL,R.N_STBL);
 #endif
+    // ── Detect firstwave_evidence from player code ─────────────────────────────
+    // Find: LDA chnwave,X; AND chngate,X; STA $D404,X (ZP or abs indexed)
+    // Then find what writes to chnwave: LDA abs,Y (B9 = table → real column,
+    // supports noinsvib=true) or LDA #imm (A9 → fixedparams).
+    int firstwave_evidence=-1; // -1=unknown, 0=fixedparams(LDA#imm), 1=table(LDA abs,Y)
+    // ZP-indexed form: B5 zp; 35 zp; 9D 04 D4
+    for(int i=0;i<code_len-6&&firstwave_evidence<0;i++){
+        if(code[i]==0xB5&&code[i+2]==0x35&&
+           code[i+4]==0x9D&&code[i+5]==0x04&&code[i+6]==0xD4){
+            uint8_t cw=code[i+1];
+            for(int m=2;m<code_len-1;m++){
+                if(code[m]==0x95&&code[m+1]==cw){
+                    if(m>=3&&code[m-3]==0xB9) firstwave_evidence=1;
+                    else if(m>=2&&code[m-2]==0xA9) firstwave_evidence=0;
+                    break;
+                }
+            }
+        }
+    }
+    // Abs-indexed form: BD lo hi; 3D lo hi; 9D 04 D4
+    for(int i=0;i<code_len-8&&firstwave_evidence<0;i++){
+        if(code[i]==0xBD&&code[i+3]==0x3D&&
+           code[i+6]==0x9D&&code[i+7]==0x04&&code[i+8]==0xD4){
+            uint8_t cw_lo=code[i+1], cw_hi=code[i+2];
+            for(int m=3;m<code_len-2;m++){
+                if(code[m]==0x9D&&code[m+1]==cw_lo&&code[m+2]==cw_hi){
+                    if(m>=3&&code[m-3]==0xB9) firstwave_evidence=1;
+                    else if(m>=2&&code[m-2]==0xA9) firstwave_evidence=0;
+                    break;
+                }
+            }
+        }
+    }
+    printf("firstwave_evidence=%d\n",firstwave_evidence);
+
     std::sort(results.begin(),results.end(),[&](const Combo&x,const Combo&y){
         // Prefer layouts that actually populate PTBL/FTBL from real column
         // data over degenerate (nopulse&&nofilter) layouts that dump the same
@@ -420,7 +470,12 @@ int main(int argc, char *argv[]) {
         // makes max_p=max_f=0 by construction, regardless of column content.
         int xt=(!x.nopulse)+(!x.nofilter), yt=(!y.nopulse)+(!y.nofilter);
         if(xt!=yt) return xt>yt;
-        return x.noinsvib<y.noinsvib;
+        if(x.noinsvib!=y.noinsvib){
+            // evidence=1 (table read → real firstwave column) → prefer noinsvib=true
+            if(firstwave_evidence==1) return x.noinsvib>y.noinsvib;
+            return x.noinsvib<y.noinsvib; // default: prefer noinsvib=false
+        }
+        return false;
     });
     Combo &best=results[0];
     printf("Layout: nopulse=%d nofilter=%d noinsvib=%d fixedparams=%d (diff=%d)\n",
@@ -434,6 +489,24 @@ int main(int argc, char *argv[]) {
     // these via makespeedtable(data,mode,makenew=0) -- dedup by (l,r), data==0
     // means no entry (resulting index 0). We replicate that here so the
     // GTS5 output has a real STBL and STBL-index pattern args/instrument ptrs.
+    //
+    // NOTE: an earlier version of this code (incorrectly) concluded that
+    // PORTAUP/PORTADOWN/TONEPORTA's real speed source was always the
+    // triggering instrument's column6, not the pattern's own arg byte. That
+    // was based on disassembling only the effect-0 path of this player's
+    // tick0 dispatch ($131A, reached when there's no explicit pattern
+    // command). What was missed: the JSR target at $11A4/$11AD is itself
+    // self-modified per effect number via a jump table at $1010 (mirroring
+    // GoatTracker v2.06's mt_tick0jumptbl/mt_tick0jump1+1/mt_tick0jump2+1
+    // mechanism) -- effect 0 -> $131A (discards the passed arg, substitutes
+    // column6), but effects 1/2 -> $1320 and effects 3/4 -> $1327, both of
+    // which store the passed-in A (the pattern's own arg, loaded right
+    // before the call) through untouched. So the pattern's arg byte is the
+    // genuine speed source for PORTAUP/PORTADOWN/TONEPORTA/VIBRATO after
+    // all, exactly as in stock GoatTracker; only the implicit "no explicit
+    // command" default-vibrato case (effect 0) uses the instrument's column6
+    // -- which is already handled correctly via the per-instrument STBL
+    // pointer synthesized below. No playback-order simulation is needed.
     std::vector<uint8_t> legacy_vibdelay(N_INSTR,0), legacy_stblptr(N_INSTR,0);
     if(best.legacy_format){
         std::vector<std::pair<uint8_t,uint8_t>> entries;
@@ -453,7 +526,8 @@ int main(int argc, char *argv[]) {
             legacy_stblptr[i]=(uint8_t)stbl_index(best.vibd[i],MST_FINEVIB);
         }
         // Pattern commands: PORTAUP/PORTADOWN/TONEPORTA -> portamento mode,
-        // VIBRATO -> finevibrato mode, FUNKTEMPO -> funktempo mode.
+        // VIBRATO -> finevibrato mode, FUNKTEMPO -> funktempo mode. All read
+        // straight from the pattern's own arg byte.
         for(int p=0;p<=highest_patt&&p<gt::MAX_PATT;p++){
             for(int r=0;r<patt_len[p]&&r<gt::MAX_PATTROWS;r++){
                 uint8_t cmd=patt_data[p][r*4+2];
@@ -475,12 +549,67 @@ int main(int argc, char *argv[]) {
     (void)nopulse; (void)nofilter; (void)noinsvib;
     int N_WTBL=best.N_WTBL, N_PTBL=best.N_PTBL, N_FTBL=best.N_FTBL, N_STBL=best.N_STBL;
 
-    // ── Detect nowavedelay from raw WTBL_L ─────────────────────────────────────
+    // nowavedelay detected from disassembly in the wave_entry scan below
     bool nowavedelay=true;
-    { bool dir=false,shft=false;
-      for(uint8_t v:best.wtbl_L){if(v==0x41||v==0x81)dir=true;if(v==0x51||v==0x91)shft=true;}
-      if(!dir&&shft) nowavedelay=false; }
-    printf("nowavedelay=%d\n",(int)nowavedelay);
+
+    // ── Detect WTBL R-byte relative/absolute test polarity from the player ────
+    // The wave-exec routine reads the current row's R-byte and branches on its
+    // sign to decide relative (add to current note) vs absolute (use as-is)
+    // pitch-offset interpretation. GoatTracker v2.0's standard players use
+    // "bmi" (bit7 set = absolute, clear = relative) and store the R-byte
+    // verbatim with no transform needed. From some point before v2.18 onward
+    // (confirmed in v2.34/2.51/2.73 sources) this flipped to "bpl" (bit7 set =
+    // relative, clear = absolute) -- the opposite polarity. Because both
+    // conventions finish with "and #$7f", XOR-ing the raw byte with 0x80
+    // exactly translates between them (R^0x80 leaves (N+R)&0x7f invariant for
+    // any N, since 0x80 == 0 mod 128), so detecting which one this specific
+    // binary's player actually uses is what decides whether to apply that XOR
+    // -- not the legacy_format/STBL-presence flag, which conflates both eras.
+    bool wtbl_r_needs_xor=false; // default: no transform (matches v2.0/legacy-format default)
+    {
+        int mt_wavetbl_final=icols0+best.ncols_try*N_INSTR+1;
+        // Anchor on the wave-exec entry (the delay-threshold check we already
+        // know the shape of: "lda wavetbl-1,y; cmp #$08-or-$10; bcs ...") and
+        // search forward within that routine for the relative/absolute mask
+        // ("and #$7f"), then look backward from there for the nearest bpl/bmi.
+        // This is robust to the R-byte test not being textually adjacent to
+        // its own table read (e.g. when an intervening "is R==0" special case
+        // branches elsewhere first, as seen in this exact file).
+        int wave_entry=-1;
+        for(int i=0;i<code_len-5;i++){
+            if(code[i]!=0xb9) continue;
+            int a=code[i+1]|(code[i+2]<<8);
+            if(a!=mt_wavetbl_final-1) continue;
+            // NOWAVEDELAY==0 build: "cmp #$08-or-$10; bcs ...". NOWAVEDELAY==1
+            // build (no delay feature compiled in): "beq mt_nowavechange"
+            // directly, no cmp at all.
+            if(code[i+3]==0xc9&&(code[i+4]==0x08||code[i+4]==0x10)){
+                wave_entry=i;
+                if(code[i+4]==0x10) nowavedelay=false; // v2.2+ CMP #$10: delay rows present
+                break;
+            }
+            if(code[i+3]==0xf0){ wave_entry=i; break; } // BEQ: NOWAVEDELAY=1 → nowavedelay stays true
+        }
+        int and7f=-1, found_branch=0; // 0=not found, 1=bpl, -1=bmi
+        if(wave_entry>=0){
+            for(int j=wave_entry;j<wave_entry+200&&j<code_len-1;j++)
+                if(code[j]==0x29&&code[j+1]==0x7f){ and7f=j; break; }
+            if(and7f>=0){
+                for(int k=and7f-1;k>=and7f-12&&k>=wave_entry;k--){
+                    if(code[k]==0x10){ wtbl_r_needs_xor=true; found_branch=1; break; }
+                    if(code[k]==0x30){ wtbl_r_needs_xor=false; found_branch=-1; break; }
+                }
+            }
+        }
+        // Legacy (v2.0/v2.06) always uses BMI polarity: override any false-positive BPL
+        // pickup caused by unrelated branches in the wave-exec body.
+        if(best.legacy_format) wtbl_r_needs_xor=false;
+        printf("WTBL R-byte polarity: %s\n",
+               found_branch>0&&!best.legacy_format?"bpl/inverted (xor applied)":
+               found_branch<0||best.legacy_format?"bmi/standard (verbatim)":
+               "not found in player code (defaulting to verbatim)");
+        printf("nowavedelay=%d\n",(int)nowavedelay);
+    }
 
     // ── fixedparams: scan player for GATETIMERPARAM and FIRSTWAVEPARAM ───────
     uint8_t fp_gate=6, fp_first=0x09;
@@ -496,13 +625,16 @@ int main(int argc, char *argv[]) {
     }
 
     // ── Apply inverse transforms ────────────────────────────────────────────────
-    // Older (v2.0-style, legacy_format) relocators store WTBL/FTBL verbatim:
-    // no R^0x80, no wave-delay remap, no filter-cutoff remap. Only v2.73-style
-    // (non-legacy) binaries need these inverses undone.
+    // wtbl_l_inv's nowavedelay-shift question and the WTBL R-byte XOR question
+    // are decided independently (L-byte delay/waveform remap vs R-byte pitch-
+    // offset polarity); legacy_format alone is too coarse a signal for either,
+    // but particularly for R, where we now detect the real player convention
+    // directly above instead of assuming it from STBL presence.
     std::vector<uint8_t> wtbl_l(N_WTBL),wtbl_r(N_WTBL);
     for(int k=0;k<N_WTBL;k++){
         wtbl_l[k]=best.legacy_format?best.wtbl_L[k]:wtbl_l_inv(best.wtbl_L[k],nowavedelay);
-        wtbl_r[k]=best.legacy_format?best.wtbl_R[k]:wtbl_r_inv(best.wtbl_R[k],best.wtbl_L[k]);
+        wtbl_r[k]=wtbl_r_needs_xor?wtbl_r_inv(best.wtbl_R[k],best.wtbl_L[k]):best.wtbl_R[k];
+        if(getenv("WTBL_DEBUG")) printf("k=%2d rawL=%02x rawR=%02x -> outL=%02x outR=%02x\n",k,best.wtbl_L[k],best.wtbl_R[k],wtbl_l[k],wtbl_r[k]);
     }
     std::vector<uint8_t> &ptbl_l=best.ptbl_L, &ptbl_r=best.ptbl_R;
     std::vector<uint8_t> ftbl_l(N_FTBL),ftbl_r(N_FTBL);
