@@ -447,10 +447,11 @@ int main(int argc, char *argv[]) {
             }
         }
     }
-    // Abs-indexed form: BD lo hi; 3D lo hi; 9D 04 D4
+    // Abs-indexed form: BD lo hi; 3D lo2 hi2; 9D lo3 hi3
+    // Accept any STA abs,X destination (not just $D404,X) because some players
+    // write through a RAM shadow that is bulk-copied to SID via a loop.
     for(int i=0;i<code_len-8&&firstwave_evidence<0;i++){
-        if(code[i]==0xBD&&code[i+3]==0x3D&&
-           code[i+6]==0x9D&&code[i+7]==0x04&&code[i+8]==0xD4){
+        if(code[i]==0xBD&&code[i+3]==0x3D&&code[i+6]==0x9D){
             uint8_t cw_lo=code[i+1], cw_hi=code[i+2];
             for(int m=3;m<code_len-2;m++){
                 if(code[m]==0x9D&&code[m+1]==cw_lo&&code[m+2]==cw_hi){
@@ -649,6 +650,20 @@ int main(int argc, char *argv[]) {
         printf("fixedparams: gate=%02x firstwave=%02x\n",fp_gate,fp_first);
     }
 
+    // ── Detect SIMPLEPULSE=1 from player code ─────────────────────────────────
+    // SIMPLEPULSE=1 writes the same packed byte to both $D402,X and $D403,X
+    // with no intervening LDA. Pattern: STA $D402,X (9D 02 D4) immediately
+    // followed by STA $D403,X (9D 03 D4). This occurs both in the pulse player
+    // loop and in voice-init sequences in SIMPLEPULSE=1 players; SIMPLEPULSE=0
+    // players never have this adjacency since they write different hi/lo values.
+    bool simplepulse = false;
+    {
+        static const uint8_t sp1[] = {0x9D,0x02,0xD4,0x9D,0x03,0xD4};
+        for(int i=0;i<code_len-5;i++)
+            if(memcmp(&code[i],sp1,6)==0){ simplepulse=true; break; }
+        printf("simplepulse=%d\n",(int)simplepulse);
+    }
+
     // ── Apply inverse transforms ────────────────────────────────────────────────
     // wtbl_l_inv's nowavedelay-shift question and the WTBL R-byte XOR question
     // are decided independently (L-byte delay/waveform remap vs R-byte pitch-
@@ -661,7 +676,18 @@ int main(int argc, char *argv[]) {
         wtbl_r[k]=wtbl_r_needs_xor?wtbl_r_inv(best.wtbl_R[k],best.wtbl_L[k]):best.wtbl_R[k];
         if(getenv("WTBL_DEBUG")) printf("k=%2d rawL=%02x rawR=%02x -> outL=%02x outR=%02x\n",k,best.wtbl_L[k],best.wtbl_R[k],wtbl_l[k],wtbl_r[k]);
     }
-    std::vector<uint8_t> &ptbl_l=best.ptbl_L, &ptbl_r=best.ptbl_R;
+    std::vector<uint8_t> ptbl_l(N_PTBL),ptbl_r(N_PTBL);
+    for(int k=0;k<N_PTBL;k++){
+        uint8_t bl=best.ptbl_L[k],br=best.ptbl_R[k];
+        if(simplepulse && bl==0x80){
+            // SIMPLEPULSE=1 SET entry: binary L is always clipped to 0x80,
+            // binary R = (editor_L & 0x0F) | (editor_R & 0xF0). Invert:
+            ptbl_l[k]=0x80|(br&0x0f);
+            ptbl_r[k]=br&0xf0;
+        } else {
+            ptbl_l[k]=bl; ptbl_r[k]=br;
+        }
+    }
     std::vector<uint8_t> ftbl_l(N_FTBL),ftbl_r(N_FTBL);
     for(int k=0;k<N_FTBL;k++){
         ftbl_l[k]=best.legacy_format?best.ftbl_L[k]:ftbl_l_inv(best.ftbl_L[k]);
