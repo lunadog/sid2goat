@@ -16,12 +16,14 @@
 static int unpack_patt(uint8_t *out, const uint8_t *data, int off, int maxlen) {
     int pos=off, row=0;
     uint8_t cmd=0, arg=0;
+    uint8_t cur_instr=0;
     while (row<gt::MAX_PATTROWS && pos<maxlen) {
         uint8_t b=data[pos++];
         if (b==0x00) break;
         uint8_t row_instr=0;
         if (b<gt::FX) {
             row_instr=b;
+            cur_instr=b;
             if(pos>=maxlen) break;
             b=data[pos++];
             if(b==0x00) break;
@@ -43,7 +45,11 @@ static int unpack_patt(uint8_t *out, const uint8_t *data, int off, int maxlen) {
                 out[row*4+0]=gt::REST; out[row*4+1]=0; out[row*4+2]=cmd; out[row*4+3]=arg;
             }
         } else {
-            uint8_t oi=(b!=gt::REST)?row_instr:0;
+            uint8_t oi;
+            if (b>=gt::FIRSTNOTE && b<=gt::LASTNOTE)
+                oi=row_instr?row_instr:cur_instr;
+            else
+                oi=(b!=gt::REST)?row_instr:0;
             out[row*4+0]=b; out[row*4+1]=oi; out[row*4+2]=cmd; out[row*4+3]=arg; row++;
         }
     }
@@ -441,7 +447,9 @@ int main(int argc, char *argv[]) {
             for(int m=2;m<code_len-1;m++){
                 if(code[m]==0x95&&code[m+1]==cw){
                     if(m>=3&&code[m-3]==0xB9) firstwave_evidence=1;
+                    else if(m>=5&&code[m-5]==0xB9&&code[m-2]==0xF0) firstwave_evidence=1;
                     else if(m>=2&&code[m-2]==0xA9) firstwave_evidence=0;
+                    else if(m>=4&&code[m-4]==0xA9&&code[m-2]==0xF0) firstwave_evidence=0;
                     break;
                 }
             }
@@ -456,7 +464,9 @@ int main(int argc, char *argv[]) {
             for(int m=3;m<code_len-2;m++){
                 if(code[m]==0x9D&&code[m+1]==cw_lo&&code[m+2]==cw_hi){
                     if(m>=3&&code[m-3]==0xB9) firstwave_evidence=1;
+                    else if(m>=5&&code[m-5]==0xB9&&code[m-2]==0xF0) firstwave_evidence=1;
                     else if(m>=2&&code[m-2]==0xA9) firstwave_evidence=0;
+                    else if(m>=4&&code[m-4]==0xA9&&code[m-2]==0xF0) firstwave_evidence=0;
                     break;
                 }
             }
