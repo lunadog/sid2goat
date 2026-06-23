@@ -280,6 +280,97 @@ threshold, `BPL mt_wavenoteabs` R-byte polarity).
    causing Skyscape's scan to return -1 (combo still selected correctly by
    structural elimination, but evidence-quality improved).
 
+7. **Binary WTBL L=0x00 mapped to editor L=0x00, causing silence in GoatTracker; R=0x80 broke round-trip.**
+   In the v2.2+ 6502 player (nowavedelay=false), binary WTBL L=0x00 falls in the
+   delay path (L < 0x10 threshold). With delay=0 and counter starting at 0, the
+   BEQ fires immediately on tick 1: it branches past both `STA chnwave` and the
+   R-byte read, advancing the wavetable position without changing waveform or note.
+   Our inverse transform (`wtbl_l_inv`) correctly returns 0x00 for binary 0x00, but
+   GoatTracker's C++ player has no delay-0 concept — L=0x00 falls below WAVEDELAY
+   (0x01), so the C++ player treats it as "set waveform register to 0x00 = silence."
+   For `Learning_Curver.sid`: instruments 6 and 8 both have binary L=0x00 entries
+   mid-sequence (entries 23 and 43–47 of the global WTBL), silencing those voices.
+   **Fix**: after the WTBL inverse-transform loop, add a post-processing pass that
+   tracks the last editor waveform/silent L value (0x10–0xEF) as `prev_wave`. Any
+   entry with editor L=0x00 is replaced with `(prev_wave, R=0x00)` — keep the
+   previous waveform unchanged AND no note change (editor R=0x00 = relative change
+   of 0, which compiles back to binary R = 0x00 XOR 0x80 = 0x80; in the 6502 player
+   binary R=0x80 → relative 0x80 → and #$7F → 0 = no note change, matching the
+   original binary's behavior of ignoring the R-byte entirely). R-bytes at binary
+   L=0x00 entries are discarded. **Note**: an earlier version of this fix used R=0x80
+   (editor absolute note 0), which compiles to binary R=0x00 = absolute note 0 —
+   causing wrong notes when the SNG is compiled back to SID. R=0x00 is correct.
+
+8. **`firstwave_evidence` scan stopped at first `STA chnwave,X` even without a match,
+   and comparator had no `fixedparams` criterion — wrong combo selected for `lnj.sid`.**
+   Two related issues in the combo-selection path:
+   (a) The inner scan loop for both ZP-indexed and abs-indexed forms unconditionally
+   `break`ed after the FIRST `STA chnwave,X` match, regardless of whether any of
+   the four lookback conditions (B9/A9 ± BEQ) actually matched. For `lnj.sid` (a
+   `fixedparams=true` song), the first `STA 0x13CC,X` in the binary appears after
+   an RTS with no recognizable lookback — the real `LDA #$09; STA 0x13CC,X`
+   (instrument-trigger init with firstwave constant) is a SECOND occurrence. The
+   scan broke at the first and returned evidence=-1 (unknown) instead of 0 (constant).
+   **Fix**: remove the unconditional `break`; only break when evidence is actually
+   set. Use `&&firstwave_evidence<0` in the loop condition instead.
+   (b) The sort comparator had no criterion distinguishing `fixedparams=true`
+   (ncols_try==N_COLS, no gt/fw columns) from `fixedparams=false` (ncols_try=9,
+   reads gt/fw columns from inside the WTBL data). Both combos had equal scores on
+   all existing criteria (same PTBL/FTBL count, same noinsvib). `std::sort` is NOT
+   stable, so either could come out first — in practice the ncols_try=9 combo won,
+   reading WTBL from the wrong position and giving instruments gt=00 fw=00 instead
+   of the correct gt=02 fw=09.
+   **Fix**: add two new comparator steps: (1) prefer `ncols_try <= N_COLS` (combo
+   fits within the detected column count — doesn't read past the clustering boundary
+   into actual table data); (2) prefer `fixedparams` per firstwave_evidence (evidence=0
+   → prefer fixedparams=true; evidence=1 → prefer fixedparams=false). Together these
+   ensure lnj.sid selects ncols_try=7, fixedparams=true, gatetimer=02, firstwave=09.
+
+10. **DEFAULTTEMPO not encoded → GoatTracker's C++ player stopped songs where gatetimer > 5.**
+    GoatTracker C++ player (`gplay.c:334`) checks on every counter reload: if
+    `gatetimer > tick` (where tick was just reloaded from `tempo`), it calls
+    `stopsong()` ("illegally high gatetimer"). The default initial `tempo = 5`
+    (= `6-1`). Any song with instruments having `gatetimer > 5` — including
+    `sids/Learning_Curver.sid` (gatetimers 0x0A=10 on instruments 1-5) —
+    would be silenced immediately because the very first counter reload uses
+    tempo=5, and 10 > 5 triggers the stop before any pattern-level CMD_SETTEMPO
+    can take effect. In the original SNG, `greloc.c` reads `DEFAULTTEMPO =
+    instr[63].ad - 1` (when `instr[63].ad >= 2`), compiles that into the binary
+    init code (`A9 DT; STA mt_chntempo,X`), and `gplay.c` uses the same
+    `instr[63].ad` field to override the initial tempo. The converter was not
+    recovering this field. **Fix**: scan the binary for the init pattern
+    `A9 DT; STA mt_chntempo,X (9D lo hi); LDA #1; STA mt_chncounter,X (9D lo+1 hi)`
+    (adjacent addresses identify chntempo/chncounter pair). When `DT > 5`, set
+    `song.instr[63].ad = DT+1` and uncomment the gsong.cpp instrument-detection
+    loop so instruments beyond `highestusedinstr` are written to the SNG if their
+    `ad` field is non-zero. Affects: `sids/Learning_Curver.sid` (DT=23, gatetimer=10),
+    `MoreFunToComputeTSJ_4x.sid` (DT=23, gatetimer=8), `$3LastNight_Jammer.sid`
+    (DT=23, gatetimer=2 — no silent bug but now encodes tempo correctly),
+    `gt2.0.sid` (DT=11, gatetimer=2 — same). DT=5 songs are unaffected.
+
+9. **LDA abs,Y scanner skipped real instructions when `B9` appeared as an operand byte.**
+   The scanner advanced `i+=2` after each B9 detection to skip the two operand bytes
+   of what it assumed was a real LDA instruction. But if a `B9` byte appeared as the
+   *address low byte* of a preceding instruction (e.g. `STA $0FB9,X` = `9D B9 0F`),
+   the scanner would treat that operand `B9` as a new LDA opcode, advance `i` by 2
+   from that position, and land *past* the real LDA that immediately followed. For
+   `sids/lc.sid`: `9D B9 0F` (STA $0FB9,X) at SID 0x0E3C has `B9` at 0x0E3D; the
+   scanner advanced from 0x0E3D+2=0x0E3F, then the for-loop did i++ → 0x0E40,
+   skipping the real `B9 1F 11` (LDA $111F,Y, the SR column) at 0x0E3F. Result:
+   the SR column was absent from `da`, breaking the stride-8 sequence from AD (0x1117)
+   to W (0x1127) — gap became 16 instead of 8 — so the clustering found only the
+   5 columns starting at W (not 7 starting at AD). This caused the converter to
+   misidentify the 5 binary columns [W, P, F, gt, fw] as [AD, SR, W, P, F], making
+   all instrument fields wrong and selecting fixedparams=1 (constant gt=06 fw=0F)
+   instead of fixedparams=0 (per-instrument).
+   **Fix**: removed the `i+=2` skip entirely. Every byte position is checked for B9.
+   Spurious B9 operand bytes produce addresses that are either out of range (filtered)
+   or produce entries with outlier code-offsets that the clustering's spread-300 check
+   rejects. With the fix, lc.sid detects N_COLS=7 (AD + SR + W + P + F + gt + fw),
+   and the correct combo (ncols_try=7, fixedparams=0, noinsvib=1) is selected —
+   byte-identical to the reference `sids/lc.sng`. All other regression files
+   unaffected.
+
 ## Outstanding — none known
 
 `Nineteen.sid` and `N_O_U_A_G_O_O_T_L_A_part_4.sid` verified correct by ear as of
@@ -288,7 +379,13 @@ byte-identical output to the original release binary as of 2026-06-18.
 `Blaster.sid` PTBL fix applied 2026-06-21. `N_O_U_A_G_O_O_T_L_A_part_4.sid`
 SIMPLEPULSE=1 fix applied 2026-06-21 (both files). `sids/FamiCommodore.sid`
 abs-indexed firstwave_evidence scan extended 2026-06-21. `sids/Skyscape.sid`
-instrument carry-forward fix applied 2026-06-21. No further known bugs.
+instrument carry-forward fix applied 2026-06-21. `sids/Learning_Curver.sid`
+WTBL L=0x00 silence fix (R=0x80→R=0x00) applied 2026-06-22/2026-06-23. `lnj.sid`
+combo-selection and firstwave-scan fix applied 2026-06-22. `sids/lc.sid`
+LDA-scanner B9-skip fix applied 2026-06-22. `sids/Learning_Curver.sid`
+DEFAULTTEMPO/instr[63].ad fix applied 2026-06-23 (silence from gatetimer=10 > GT
+default tempo=5; also fixes tempo encoding for MoreFunToComputeTSJ_4x and
+$3LastNight_Jammer). No further known bugs.
 
 ## Gotchas / lessons learned (worth re-reading before further work)
 
@@ -341,3 +438,6 @@ instrument carry-forward fix applied 2026-06-21. No further known bugs.
 | `N_O_U_A_G_O_O_T_L_A_part_4.sid` | **1** | noinsvib=1 fixedparams=0, WTBL=55 PTBL=5 FTBL=20 STBL=1 |
 | `sids/Blaster.sid` | **1** | WTBL=23 PTBL=19 FTBL=3 STBL=1 |
 | `sids/Skyscape.sid` | **1** | noinsvib=1 fixedparams=0, WTBL=13 PTBL=11 FTBL=6 STBL=0 |
+| `sids/Learning_Curver.sid` | 0 | noinsvib=0 fixedparams=0, WTBL=49 PTBL=52 FTBL=47 STBL=1, instr[63].ad=24 — **verified** (L=0x00 R=0x00 + DEFAULTTEMPO=23 fix) |
+| `lnj.sid` | 0 | noinsvib=0 fixedparams=1, WTBL=144 PTBL=36 FTBL=45 STBL=8 (gatetimer=02 firstwave=09 all instrs) |
+| `sids/lc.sid` | 0 | noinsvib=1 fixedparams=0, WTBL=49 PTBL=52 FTBL=47 STBL=0 — **byte-identical** to reference (B9-scanner fix) |

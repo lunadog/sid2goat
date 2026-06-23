@@ -160,13 +160,16 @@ bool gt::Song::save(char const* filename) {
     if (!file) return false;
     fwrite("GTS5", 1, 4, file);
 
-    //for (int c = 1; c < MAX_INSTR; c++) {
-    //    if (instr[c].ad || instr[c].sr || instr[c].ptr[0] || instr[c].ptr[1] ||
-    //        instr[c].ptr[2] || instr[c].vibdelay || instr[c].ptr[3])
-    //    {
-    //        if (c > highestusedinstr) highestusedinstr = c;
-    //    }
-    //}
+    // Instruments beyond those used in patterns may carry song-global parameters
+    // (e.g. instr[63].ad encodes DEFAULTTEMPO for GoatTracker's C++ player).
+    // Include them in the output if any non-tempo/wave field is non-zero.
+    for (int c = 1; c < MAX_INSTR; c++) {
+        if (instr[c].ad || instr[c].sr || instr[c].ptr[0] || instr[c].ptr[1] ||
+            instr[c].ptr[2] || instr[c].vibdelay || instr[c].ptr[3])
+        {
+            if (c > highestusedinstr) highestusedinstr = c;
+        }
+    }
 
     // infotexts
     fwrite(songname, 1, sizeof(songname), file);

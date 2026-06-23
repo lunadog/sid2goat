@@ -128,7 +128,9 @@ int main(int argc, char *argv[]) {
         if (code[i]==0xb9) {
             int a=code[i+1]|(code[i+2]<<8);
             if (a>=la&&a<la+code_len) { ldas.push_back({i,a}); aset.insert(a); acnt[a]++; }
-            i+=2;
+            // No i+=2 skip: a B9 operand byte in a preceding instruction can mask
+            // a real LDA abs,Y that follows. Checking every position is safe because
+            // spurious in-range addresses are filtered by the clustering spread check.
         }
     }
     (void)aset; (void)acnt;
@@ -444,13 +446,13 @@ int main(int argc, char *argv[]) {
         if(code[i]==0xB5&&code[i+2]==0x35&&
            code[i+4]==0x9D&&code[i+5]==0x04&&code[i+6]==0xD4){
             uint8_t cw=code[i+1];
-            for(int m=2;m<code_len-1;m++){
+            for(int m=2;m<code_len-1&&firstwave_evidence<0;m++){
                 if(code[m]==0x95&&code[m+1]==cw){
                     if(m>=3&&code[m-3]==0xB9) firstwave_evidence=1;
                     else if(m>=5&&code[m-5]==0xB9&&code[m-2]==0xF0) firstwave_evidence=1;
                     else if(m>=2&&code[m-2]==0xA9) firstwave_evidence=0;
                     else if(m>=4&&code[m-4]==0xA9&&code[m-2]==0xF0) firstwave_evidence=0;
-                    break;
+                    // No match: don't break — keep searching for more STA chnwave,X
                 }
             }
         }
@@ -461,13 +463,13 @@ int main(int argc, char *argv[]) {
     for(int i=0;i<code_len-8&&firstwave_evidence<0;i++){
         if(code[i]==0xBD&&code[i+3]==0x3D&&code[i+6]==0x9D){
             uint8_t cw_lo=code[i+1], cw_hi=code[i+2];
-            for(int m=3;m<code_len-2;m++){
+            for(int m=3;m<code_len-2&&firstwave_evidence<0;m++){
                 if(code[m]==0x9D&&code[m+1]==cw_lo&&code[m+2]==cw_hi){
                     if(m>=3&&code[m-3]==0xB9) firstwave_evidence=1;
                     else if(m>=5&&code[m-5]==0xB9&&code[m-2]==0xF0) firstwave_evidence=1;
                     else if(m>=2&&code[m-2]==0xA9) firstwave_evidence=0;
                     else if(m>=4&&code[m-4]==0xA9&&code[m-2]==0xF0) firstwave_evidence=0;
-                    break;
+                    // No match: don't break — keep searching for more STA chnwave,X
                 }
             }
         }
@@ -503,6 +505,12 @@ int main(int argc, char *argv[]) {
         // makes max_p=max_f=0 by construction, regardless of column content.
         int xt=(!x.nopulse)+(!x.nofilter), yt=(!y.nopulse)+(!y.nofilter);
         if(xt!=yt) return xt>yt;
+        // Prefer combos that fit within the detected column count. ncols_try==N_COLS
+        // means the WTBL starts exactly where clustering placed it; ncols_try>N_COLS
+        // reads past the detected columns into the actual table data, giving a wrong
+        // WTBL start address and corrupted table content.
+        bool xf=(x.ncols_try<=N_COLS), yf=(y.ncols_try<=N_COLS);
+        if(xf!=yf) return xf;
         // Use disassembly evidence to distinguish pulse (per-channel, X-indexed)
         // from filter (global) table when total optional-table count is equal.
         if(x.nopulse!=y.nopulse){
@@ -513,6 +521,13 @@ int main(int argc, char *argv[]) {
             // evidence=1 (table read → real firstwave column) → prefer noinsvib=true
             if(firstwave_evidence==1) return x.noinsvib>y.noinsvib;
             return x.noinsvib<y.noinsvib; // default: prefer noinsvib=false
+        }
+        if(x.fixedparams!=y.fixedparams){
+            // evidence=0: LDA #imm (constant) → prefer fixedparams=true
+            // evidence=1: LDA abs,Y (table) → prefer fixedparams=false
+            // evidence=-1 unknown: conservative preference for fixedparams=true
+            if(firstwave_evidence==1) return !x.fixedparams;
+            return x.fixedparams;
         }
         return false;
     });
@@ -660,6 +675,25 @@ int main(int argc, char *argv[]) {
         printf("fixedparams: gate=%02x firstwave=%02x\n",fp_gate,fp_first);
     }
 
+    // ── Find DEFAULTTEMPO from player init sequence ───────────────────────────
+    // greloc.c compiles: LDA #DEFAULTTEMPO / STA mt_chntempo,X / LDA #1 / STA mt_chncounter,X
+    // where DEFAULTTEMPO = instr[63].ad - 1 (from the original SNG, when instr[63].ad >= 2).
+    // Without this value in the SNG, GoatTracker's C++ player starts with tempo=5 and
+    // immediately calls stopsong() when gatetimer > 5 ("illegally high gatetimer" check
+    // at gplay.c:334: fires on the first counter reload when tempo < gatetimer).
+    // Pattern: A9 DT  9D lo hi  A9 01  9D lo+1 hi  (10 bytes, lo bytes adjacent)
+    int defaulttempo = -1;
+    for(int i=0; i<code_len-9; i++){
+        if(code[i]==0xa9 && code[i+2]==0x9d &&
+           code[i+5]==0xa9 && code[i+6]==0x01 && code[i+7]==0x9d &&
+           code[i+8]==(uint8_t)(code[i+3]+1) && code[i+9]==code[i+4]){
+            defaulttempo = code[i+1];
+            printf("DEFAULTTEMPO=%d (found at SID 0x%04x)\n", defaulttempo, la+i);
+            break;
+        }
+    }
+    if(defaulttempo < 0) printf("DEFAULTTEMPO: not found in player code\n");
+
     // ── Detect SIMPLEPULSE=1 from player code ─────────────────────────────────
     // SIMPLEPULSE=1 writes the same packed byte to both $D402,X and $D403,X
     // with no intervening LDA. Pattern: STA $D402,X (9D 02 D4) immediately
@@ -685,6 +719,25 @@ int main(int argc, char *argv[]) {
         wtbl_l[k]=best.legacy_format?best.wtbl_L[k]:wtbl_l_inv(best.wtbl_L[k],nowavedelay);
         wtbl_r[k]=wtbl_r_needs_xor?wtbl_r_inv(best.wtbl_R[k],best.wtbl_L[k]):best.wtbl_R[k];
         if(getenv("WTBL_DEBUG")) printf("k=%2d rawL=%02x rawR=%02x -> outL=%02x outR=%02x\n",k,best.wtbl_L[k],best.wtbl_R[k],wtbl_l[k],wtbl_r[k]);
+    }
+    // Binary L=0x00 is "delay=0" in the 6502 player: the delay path fires
+    // immediately on tick 1 (counter==delay==0 → BEQ), skipping both STA chnwave
+    // and the R-byte read. The waveform register and freq are both unchanged.
+    // GT C++ player has no delay-0 concept — editor L=0x00 falls below WAVEDELAY
+    // (0x01), so it would set waveform to 0 (silence). Replace each such entry
+    // with the previous waveform value and R=0x00 (relative change of 0 = no note
+    // change). R=0x00 compiles back to binary R=0x80 (XOR 0x80), and in the 6502
+    // player binary R=0x80 → relative 0x80 → and #$7F → 0 = no note change. ✓
+    {
+        uint8_t prev_wave = 0x00;
+        for(int k=0;k<N_WTBL;k++){
+            uint8_t el = wtbl_l[k];
+            if(el >= 0x10 && el <= 0xEF) prev_wave = el;
+            if(el == 0x00){
+                wtbl_l[k] = prev_wave;
+                wtbl_r[k] = 0x00;
+            }
+        }
     }
     std::vector<uint8_t> ptbl_l(N_PTBL),ptbl_r(N_PTBL);
     for(int k=0;k<N_PTBL;k++){
@@ -754,6 +807,17 @@ int main(int argc, char *argv[]) {
         song.instr[idx].ptr[gt::FTBL]=(uint8_t)fp;
         song.instr[idx].ptr[gt::WTBL]=wptr[i];
         song.instr[idx].ptr[gt::PTBL]=(uint8_t)pp;
+    }
+
+    // ── Encode DEFAULTTEMPO in instr[63] ─────────────────────────────────────
+    // greloc.c reads instr[63].ad-1 as DEFAULTTEMPO; gplay.c uses the same field
+    // to override the initial tempo. Without it GoatTracker C++ player defaults to
+    // tempo=5, causing silent songs when any instrument's gatetimer exceeds 5.
+    // Only encode when DT > 5 (DT==5 is GoatTracker's own default; no fix needed).
+    if(defaulttempo > 5 && defaulttempo <= 127){
+        song.instr[gt::MAX_INSTR-1].ad = (uint8_t)(defaulttempo + 1);
+        // ptr[WTBL] stays 0 (from memset); gplay.c requires this.
+        printf("instr[63].ad=%d (encodes DEFAULTTEMPO=%d)\n", defaulttempo+1, defaulttempo);
     }
 
     // ── Orderlists ────────────────────────────────────────────────────────────
